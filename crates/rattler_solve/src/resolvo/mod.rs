@@ -55,6 +55,33 @@ fn exclude_newer_reason(
     }
 }
 
+/// Determines which subdir(s) the caller is solving for based on the number of
+/// records seen for each subdir.
+///
+/// The target subdir is the most common platform-specific subdir (i.e. not
+/// `noarch`). If multiple subdirs are tied for the highest record count, all of
+/// them are considered targets. The platform independent `noarch` subdir is
+/// never returned because it is available for every platform.
+///
+/// Returns an empty set when no platform-specific records were seen, in which
+/// case no platform hint can be derived.
+fn target_subdirs(subdir_counts: &HashMap<String, usize>) -> HashSet<&str> {
+    let max_count = subdir_counts
+        .iter()
+        .filter(|(subdir, _)| subdir.as_str() != "noarch")
+        .map(|(_, count)| *count)
+        .max();
+
+    match max_count {
+        Some(max_count) => subdir_counts
+            .iter()
+            .filter(|(subdir, count)| subdir.as_str() != "noarch" && **count == max_count)
+            .map(|(subdir, _)| subdir.as_str())
+            .collect(),
+        None => HashSet::new(),
+    }
+}
+
 /// A dependency override rule.
 #[derive(Clone)]
 pub struct DependencyOverride {
@@ -351,6 +378,17 @@ impl<'a> CondaDependencyProvider<'a> {
         // Hashmap that maps the package name to the channel it was first found in.
         let mut package_name_found_in_channel = HashMap::<String, &Option<String>>::new();
 
+        // The number of records seen for each subdir across all repodata. This is
+        // used to figure out which subdir(s) the caller is actually solving for so
+        // that we can surface a helpful hint when a requested package only exists
+        // for a different platform (see conda/rattler#2476).
+        let mut subdir_counts = HashMap::<String, usize>::new();
+
+        // For every solvable that originates from the repodata we remember its
+        // subdir. This lets us, in a later pass, mark candidates that only exist
+        // for a non-target subdir as excluded with an explanatory reason.
+        let mut solvable_subdirs = HashMap::<SolvableId, String>::new();
+
         // Add additional records
         for repo_data in repodata {
             // Iterate over all records and dedup records that refer to the same package
@@ -428,6 +466,12 @@ impl<'a> CondaDependencyProvider<'a> {
                 let package_name = pool.intern_package_name(&record.package_record.name);
                 let solvable_id =
                     pool.intern_solvable(package_name, SolverPackageRecord::Record(record));
+
+                // Remember the subdir of this record so we can later detect packages
+                // that are only available for a non-target subdir.
+                let subdir = &record.package_record.subdir;
+                *subdir_counts.entry(subdir.clone()).or_default() += 1;
+                solvable_subdirs.insert(solvable_id, subdir.clone());
 
                 // Update records with all entries in a single mutable borrow
                 let candidates = records.entry(package_name).or_default();
@@ -526,6 +570,59 @@ impl<'a> CondaDependencyProvider<'a> {
                         record.package_record.name.as_normalized().to_string(),
                         &record.channel,
                     );
+                }
+            }
+        }
+
+        // When the caller supplied repodata for more than one platform-specific
+        // subdir, a requested package might only exist for a subdir that is not
+        // the one being solved for. In that situation resolvo would otherwise
+        // report a bare "No candidates were found" error, which is misleading
+        // because the package does exist, just for a different platform. To give
+        // a better hint (see conda/rattler#2476) we determine the target
+        // subdir(s) and mark candidates that only exist for some other subdir as
+        // excluded, attaching a reason that names the offending subdir(s).
+        //
+        // The `noarch` subdir is platform independent and is therefore never
+        // considered foreign.
+        let target_subdirs = target_subdirs(&subdir_counts);
+        if !target_subdirs.is_empty() {
+            for candidates in records.values_mut() {
+                // Collect the subdirs the candidates of this package are available
+                // for, ignoring the platform independent `noarch` subdir.
+                let available_subdirs: HashSet<&str> = candidates
+                    .candidates
+                    .iter()
+                    .filter_map(|id| solvable_subdirs.get(id))
+                    .map(String::as_str)
+                    .filter(|subdir| *subdir != "noarch")
+                    .collect();
+
+                // If the package is available for a target subdir (or only for
+                // `noarch`) there is nothing to hint about.
+                if available_subdirs.is_empty()
+                    || available_subdirs
+                        .iter()
+                        .any(|subdir| target_subdirs.contains(*subdir))
+                {
+                    continue;
+                }
+
+                // The package exists, but only for non-target subdir(s). Mark its
+                // records as excluded with a reason that names those subdirs.
+                let mut foreign_subdirs: Vec<&str> = available_subdirs.into_iter().collect();
+                foreign_subdirs.sort_unstable();
+                let reason = pool.intern_string(format!(
+                    "only available for subdir(s): {}",
+                    foreign_subdirs.join(", ")
+                ));
+                for &solvable_id in &candidates.candidates {
+                    if solvable_subdirs
+                        .get(&solvable_id)
+                        .is_some_and(|subdir| subdir != "noarch")
+                    {
+                        candidates.excluded.push((solvable_id, reason));
+                    }
                 }
             }
         }

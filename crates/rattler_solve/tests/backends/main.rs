@@ -834,6 +834,54 @@ mod resolvo {
         "###);
     }
 
+    /// When a requested package only exists for a non-target subdir the solver
+    /// should fail with a hint that names the subdir(s) the package is actually
+    /// available for, instead of a bare "No candidates were found" error.
+    ///
+    /// See conda/rattler#2476.
+    #[test]
+    fn test_unsat_package_only_available_for_other_subdir() {
+        // `maya` is only available for `linux-64`, while the rest of the
+        // repodata (and therefore the platform being solved for) is `win-64`.
+        let repo_data: Vec<RepoDataRecord> = vec![
+            PackageBuilder::new("maya")
+                .version("2026.0")
+                .subdir("linux-64")
+                .build(),
+            // A handful of `win-64` records establish `win-64` as the target
+            // subdir being solved for.
+            PackageBuilder::new("python")
+                .version("3.12.0")
+                .subdir("win-64")
+                .build(),
+            PackageBuilder::new("vc")
+                .version("14.0")
+                .subdir("win-64")
+                .build(),
+        ];
+
+        let task = SolverTask {
+            specs: vec![MatchSpec::from_str("maya", ParseStrictness::Lenient).unwrap()],
+            ..SolverTask::from_iter([&repo_data])
+        };
+
+        let err = rattler_solve::resolvo::Solver.solve(task).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("only available for subdir(s): linux-64"),
+            "error message should mention the foreign subdir, got: {message}"
+        );
+        assert!(
+            message.contains("excluded"),
+            "error message should mark the candidate as excluded, got: {message}"
+        );
+        insta::assert_snapshot!(err, @r###"
+        Cannot solve the request because of: The following packages are incompatible
+        └─ maya * cannot be installed because there are no viable options:
+           └─ maya 2026.0 is excluded because only available for subdir(s): linux-64
+        "###);
+    }
+
     #[test]
     fn test_flags_select_matching_variant() {
         crate::variant_flags_tests::solve_flags_select_matching_variant::<
